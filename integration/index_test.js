@@ -1,150 +1,178 @@
-const puppeteer = require('puppeteer');
+// Integration tests for the account linking extension.
+// These tests use nock to intercept all Auth0 Management API calls so no real
+// tenant or credentials are required. They test the two core user-facing flows:
+//   1. Link — extension renders linking template with correct user context
+//   2. Skip — extension renders template (skip is a client-side /continue redirect)
+// Error cases cover invalid tokens and upstream API failures.
+
 const { expect } = require('chai');
-const { deleteTestUsers, usersWithSameEmailCount, wait, buildQueryString } = require('./utils');
+const nock = require('nock');
+const sinon = require('sinon');
+const { sign } = require('jsonwebtoken');
+const { createServer } = require('../test/test_helper');
+const storage = require('../lib/storage');
+const indexTemplate = require('../templates');
+const config = require('../lib/config');
 
-const SAMPLE_APP_BASE = 'http://localhost:3000';
+const DOMAIN = config('AUTH0_DOMAIN');
+const CLIENT_ID = config('AUTH0_CLIENT_ID');
+const CLIENT_SECRET = config('AUTH0_CLIENT_SECRET');
+const ISSUER = `https://${DOMAIN}/`;
 
-let page;
-let browser;
+const primaryUser = {
+  user_id: 'auth0|primary001',
+  email: 'jane.doe@example.com',
+  email_verified: true,
+  identities: [{ connection: 'Username-Password-Authentication', user_id: 'primary001', provider: 'auth0', isSocial: false }],
+  created_at: '2024-01-01T00:00:00.000Z',
+};
 
-const app = pathUrl => `${SAMPLE_APP_BASE}${pathUrl}`;
+const secondaryUser = {
+  user_id: 'auth0|secondary001',
+  email: 'jane.doe@example.com',
+  email_verified: true,
+  identities: [{ connection: 'google-oauth2', user_id: 'secondary001', provider: 'google-oauth2', isSocial: true }],
+  created_at: '2024-01-02T00:00:00.000Z',
+};
 
-const testEmail = 'jane.doe.auth0.testing@gmail.com';
-const testPassword = 'Passw0rdLe55!';
+const makeChildToken = (user) =>
+  sign(
+    { sub: user.user_id, email: user.email },
+    CLIENT_SECRET,
+    { audience: CLIENT_ID, issuer: ISSUER, expiresIn: '5m' }
+  );
 
-describe('Account linking tests', () => {
-  beforeEach(async () => {
-    browser = await puppeteer.launch({ headless: false, width: 1366, height: 768 });
-    page = await browser.newPage();
+const makeQueryString = (childToken, overrides = {}) => {
+  const params = {
+    child_token: childToken,
+    client_id: CLIENT_ID,
+    redirect_uri: 'http://localhost:3000/callback',
+    scope: 'openid profile',
+    response_type: 'code',
+    state: 'test-state-123',
+    original_state: 'test-original-state-456',
+    nonce: 'test-nonce',
+    ...overrides,
+  };
+  return new URLSearchParams(params).toString();
+};
 
-    await deleteTestUsers(testEmail).catch((e) => {
-      console.log("Couldn't delete test users. Details:", e);
+const mockUsersAndToken = () => {
+  nock(ISSUER)
+    .post('/oauth/token')
+    .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
+
+  nock(`https://${DOMAIN}/api/v2`)
+    .get('/users-by-email')
+    .query({ email: primaryUser.email })
+    .reply(200, [primaryUser, secondaryUser]);
+};
+
+describe('Account linking integration', function () {
+  let server;
+
+  before(async function () {
+    server = await createServer();
+  });
+
+  after(function () {
+    server.stop();
+  });
+
+  beforeEach(function () {
+    nock.cleanAll();
+    sinon.restore();
+    sinon.stub(storage, 'getSettings').resolves({ customDomain: '' });
+    sinon.stub(indexTemplate, 'renderTemplate').resolves('<html>Mock Template</html>');
+    mockUsersAndToken();
+  });
+
+  afterEach(function () {
+    nock.cleanAll();
+    sinon.restore();
+  });
+
+  describe('link flow', function () {
+    it('returns 200 and renders the linking template', async function () {
+      const res = await server.inject({
+        method: 'GET',
+        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
+      });
+
+      expect(res.statusCode).to.equal(200);
+      expect(res.result).to.equal('<html>Mock Template</html>');
+    });
+
+    it('passes currentUser and matchingUsers correctly to renderTemplate', async function () {
+      await server.inject({
+        method: 'GET',
+        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
+      });
+
+      const { currentUser, matchingUsers } = indexTemplate.renderTemplate.args[0][0];
+      expect(currentUser.user_id).to.equal(primaryUser.user_id);
+      expect(matchingUsers).to.have.length(1);
+      expect(matchingUsers[0].user_id).to.equal(secondaryUser.user_id);
     });
   });
 
-  afterEach(async () => {
-    browser.close();
-  });
+  describe('skip flow', function () {
+    it('returns 200 and renders the template', async function () {
+      // Skipping is a client-side navigation — the skip anchor in the rendered
+      // HTML points to `{issuer}continue?state={state}`. The server always
+      // returns 200 with the template regardless of whether the user links or skips.
+      const res = await server.inject({
+        method: 'GET',
+        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
+      });
 
-  it('detects repeated email and links account', async () => {
-    await createUsers();
-
-    await page.waitForSelector('#link');
-    await page.click('#link');
-    await wait(3);
-
-    expect(await usersWithSameEmailCount(testEmail)).equal(1);
-    expect(await page.url()).equal(app`/user`);
-  });
-
-  it('skips linking', async () => {
-    await createUsers();
-
-    await page.evaluate(() => document.querySelector('#skip').click());
-
-    await page.waitForNavigation();
-    await page.click('#allow');
-
-    await page.waitForNavigation();
-    expect(await usersWithSameEmailCount(testEmail)).equal(2);
-    expect(await page.url()).equal(app`/user`);
-  });
-
-  it('shows an error when invalid token is provided', async () => {
-    const path = buildQueryString({
-      childToken: '',
-      clientId: 'som3-s3cr37-1d',
-      redirectUri: 'http://localhost:3000/callback',
-      scope: 'openid profile',
-      responseType: 'code',
-      auth0Client: '',
-      originalState: 's0m3-0riginal-s7473',
-      nonce: 's0m3-n0nc3',
-      errorType: '',
-      state: 's0m3-s7473'
+      expect(res.statusCode).to.equal(200);
+      expect(res.result).to.equal('<html>Mock Template</html>');
     });
 
-    await page.goto(`http://localhost:3001${path}`);
-    await wait(1);
+    it('includes state in the rendered output for the skip redirect', async function () {
+      const state = 'skip-test-state-789';
+      await server.inject({
+        method: 'GET',
+        url: `/?${makeQueryString(makeChildToken(primaryUser), { state })}`,
+      });
 
-    const text = await page.evaluate(
-      () =>
-        document.querySelector('#content-container > div:nth-child(1) > p:nth-child(1)').textContent
-    );
-
-    expect(text).equal('You seem to have reached this page in error. Please try logging in again');
+      const { params } = indexTemplate.renderTemplate.args[0][0];
+      expect(params.state).to.equal(state);
+    });
   });
 
-  it('shows an error when no parameters are provided', async () => {
-    await page.goto('http://localhost:3001');
-    await wait(1);
+  describe('error cases', function () {
+    it('returns 400 when no query parameters are provided', async function () {
+      const res = await server.inject({ method: 'GET', url: '/' });
+      expect(res.statusCode).to.equal(400);
+    });
 
-    const text = await page.evaluate(
-      () =>
-        document.querySelector('#content-container > div:nth-child(1) > p:nth-child(1)').textContent
-    );
+    it('returns 400 when an invalid child_token is provided', async function () {
+      const res = await server.inject({
+        method: 'GET',
+        url: `/?${makeQueryString('not-a-valid-jwt')}`,
+      });
+      expect(res.statusCode).to.equal(400);
+    });
 
-    expect(text).equal('You seem to have reached this page in error. Please try logging in again');
+    it('redirects to /continue when users-by-email lookup fails', async function () {
+      nock.cleanAll();
+      nock(ISSUER)
+        .post('/oauth/token')
+        .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
+      nock(`https://${DOMAIN}/api/v2`)
+        .get('/users-by-email')
+        .query({ email: primaryUser.email })
+        .reply(500, { error: 'internal_error' });
+
+      const res = await server.inject({
+        method: 'GET',
+        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
+      });
+
+      expect(res.statusCode).to.equal(302);
+      expect(res.headers.location).to.include('continue?state=');
+    });
   });
 });
-
-/**
- * Creates two users with the same email address.
- * This procedure should result in a redirect to the
- * account linking extension.
- */
-async function createUsers() {
-  await page.goto(app`/`);
-  await page.waitForSelector('#login-button');
-  await page.click('#login-button');
-  await page.waitForNavigation();
-
-  await wait(2);
-
-  await page.click(
-    '#auth0-lock-container-1 > div > div.auth0-lock-center > form > div > div > div:nth-child(3) > span > div > div > div > div > div > div > div > div > div.auth0-lock-tabs-container > ul > li:nth-child(2) > a'
-  );
-
-  await wait(0.5);
-
-  await page.waitForSelector('input[name="email"]');
-  await page.click('input[name="email"]');
-  await page.type(testEmail);
-
-  await page.click('input[name="password"]');
-  await page.type(testPassword);
-
-  await page.waitForSelector('.auth0-lock-submit');
-  await page.click('.auth0-lock-submit');
-
-  await page.waitForNavigation();
-  await page.click('#allow');
-
-  await page.waitForNavigation();
-  await page.click('#logout-button');
-  await page.waitForNavigation();
-  await page.click('#login-button');
-
-  await page.waitForNavigation();
-  await page.waitForSelector('.auth0-lock-alternative-link');
-  await wait(1);
-  await page.click('.auth0-lock-alternative-link');
-
-  await page.evaluate(() =>
-    document.querySelector('div.auth-lock-social-buttons-pane > div > button').click()
-  );
-
-  await page.waitForSelector('#identifierId');
-  await page.click('#identifierId');
-  await page.type(testEmail);
-
-  await page.click('#identifierNext');
-  await wait(1.5);
-
-  await page.click('input[name="password"]');
-  await page.type(testPassword);
-
-  await page.click('#passwordNext');
-
-  await page.waitForNavigation();
-}

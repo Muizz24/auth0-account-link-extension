@@ -67,11 +67,10 @@ const mockHandlers = { name: 'handlers', register: async (server, options) => {
   });
 } };
 
-const createServer = (configFile = '../server/config.test.json') => {
+const createServer = () => {
   nconf
     .argv()
     .env()
-    .file(path.join(__dirname, configFile))
     .defaults({
       AUTH0_RTA: 'auth0.auth0.com',
       DATA_CACHE_MAX_AGE: 1000 * 10,
@@ -92,7 +91,7 @@ const createServer = (configFile = '../server/config.test.json') => {
   return initServer(() => {}, mockHandlers);
 };
 
-const startServer = (configFile = '../server/config.test.json') =>
+const startServer = () =>
   new Promise((resolve, reject) => {
     const server = createServer();
 
