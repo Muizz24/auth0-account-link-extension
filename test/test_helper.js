@@ -83,6 +83,7 @@ const createServer = () => {
       AUTH0_CLIENT_ID: 'AUTHO_CLIENT_ID',
       AUTH0_CLIENT_SECRET: 'AUTHO_CLIENT_SECRET',
       WT_URL: 'localhost:3001',
+      PUBLIC_WT_URL: 'testWebtask',
       EXTENSION_SECRET: 'EXTENSION_SECRET'
     });
 
