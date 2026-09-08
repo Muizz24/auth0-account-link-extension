@@ -12,12 +12,12 @@ const { sign } = require('jsonwebtoken');
 const { createServer } = require('../test/test_helper');
 const storage = require('../lib/storage');
 const indexTemplate = require('../templates');
+const linkingJwtUtils = require('../lib/linkingJwtUtils');
 const config = require('../lib/config');
 
-const DOMAIN = config('AUTH0_DOMAIN');
-const CLIENT_ID = config('AUTH0_CLIENT_ID');
-const CLIENT_SECRET = config('AUTH0_CLIENT_SECRET');
-const ISSUER = `https://${DOMAIN}/`;
+// Config provider is set by createServer() in before() — these are
+// populated then and safe to use in beforeEach/it blocks after that.
+let DOMAIN, CLIENT_ID, CLIENT_SECRET, ISSUER;
 
 const primaryUser = {
   user_id: 'auth0|primary001',
@@ -57,15 +57,11 @@ const makeQueryString = (childToken, overrides = {}) => {
   return new URLSearchParams(params).toString();
 };
 
-const mockUsersAndToken = () => {
-  nock(ISSUER)
-    .post('/oauth/token')
-    .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
-
-  nock(`https://${DOMAIN}/api/v2`)
-    .get('/users-by-email')
-    .query({ email: primaryUser.email })
-    .reply(200, [primaryUser, secondaryUser]);
+const mockUsers = () => {
+  sinon.stub(linkingJwtUtils, 'fetchUsersFromToken').resolves({
+    currentUser: primaryUser,
+    matchingUsers: [secondaryUser],
+  });
 };
 
 describe('Account linking integration', function () {
@@ -73,6 +69,10 @@ describe('Account linking integration', function () {
 
   before(async function () {
     server = await createServer();
+    DOMAIN = config('AUTH0_DOMAIN');
+    CLIENT_ID = config('AUTH0_CLIENT_ID');
+    CLIENT_SECRET = config('AUTH0_CLIENT_SECRET');
+    ISSUER = `https://${DOMAIN}/`;
   });
 
   after(function () {
@@ -83,8 +83,9 @@ describe('Account linking integration', function () {
     nock.cleanAll();
     sinon.restore();
     sinon.stub(storage, 'getSettings').resolves({ customDomain: '' });
+    sinon.stub(storage, 'getLocales').resolves({ en: { or: 'or' } });
     sinon.stub(indexTemplate, 'renderTemplate').resolves('<html>Mock Template</html>');
-    mockUsersAndToken();
+    mockUsers();
   });
 
   afterEach(function () {
@@ -143,9 +144,10 @@ describe('Account linking integration', function () {
   });
 
   describe('error cases', function () {
-    it('returns 400 when no query parameters are provided', async function () {
+    it('redirects to /admin when no query parameters are provided', async function () {
       const res = await server.inject({ method: 'GET', url: '/' });
-      expect(res.statusCode).to.equal(400);
+      expect(res.statusCode).to.equal(302);
+      expect(res.headers.location).to.include('/admin');
     });
 
     it('returns 400 when an invalid child_token is provided', async function () {
@@ -157,14 +159,8 @@ describe('Account linking integration', function () {
     });
 
     it('redirects to /continue when users-by-email lookup fails', async function () {
-      nock.cleanAll();
-      nock(ISSUER)
-        .post('/oauth/token')
-        .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
-      nock(`https://${DOMAIN}/api/v2`)
-        .get('/users-by-email')
-        .query({ email: primaryUser.email })
-        .reply(500, { error: 'internal_error' });
+      // Override the default stub to simulate an upstream failure
+      linkingJwtUtils.fetchUsersFromToken.rejects(new Error('upstream failure'));
 
       const res = await server.inject({
         method: 'GET',
