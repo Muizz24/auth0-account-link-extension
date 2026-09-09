@@ -19,7 +19,7 @@ describe('Linking JWT Utils Tests', () => {
         expect(decoded.sub).to.deep.equal('auth0|67d304a8b5dd1267e87c53ba');
         expect(decoded.email).to.deep.equal('ben1@acme.com');
         expect(decoded.base).to.deep.equal('auth0.example.com/api/v2');
-        expect(decoded.aud).to.deep.equal('AUTHO_CLIENT_ID');
+        expect(decoded.aud).to.deep.equal('AUTH0_CLIENT_ID');
         expect(decoded.iss).to.deep.equal('https://test.local.dev/');
     })
     it('throws an error on validation for an a token not issued by auth0', async () => {

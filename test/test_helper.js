@@ -1,9 +1,12 @@
 const nconf = require('nconf');
+const os = require('os');
 const path = require('path');
 const request = require('request');
 const { sign } = require('jsonwebtoken');
+const { FileStorageContext } = require('auth0-extension-tools');
 const handlerUtils = require('../lib/handlerUtils');
 const initServer = require('../server/index');
+const initDb = require('../lib/db').init;
 const config = require('../lib/config');
 const certs = require('./acceptance/test_data/certs.json');
 
@@ -80,14 +83,17 @@ const createServer = () => {
       USE_OAUTH2: false,
       LOG_COLOR: true,
       AUTH0_DOMAIN: 'test.local.dev',
-      AUTH0_CLIENT_ID: 'AUTHO_CLIENT_ID',
-      AUTH0_CLIENT_SECRET: 'AUTHO_CLIENT_SECRET',
+      AUTH0_CLIENT_ID: 'AUTH0_CLIENT_ID',
+      AUTH0_CLIENT_SECRET: 'AUTH0_CLIENT_SECRET',
       WT_URL: 'localhost:3001',
       PUBLIC_WT_URL: 'testWebtask',
       EXTENSION_SECRET: 'EXTENSION_SECRET'
     });
 
   config.setProvider(key => nconf.get(key));
+
+  const tmpDb = path.join(os.tmpdir(), `auth0-ext-test-${process.pid}.json`);
+  initDb(new FileStorageContext(tmpDb, { force: 1 }));
 
   return initServer(() => {}, mockHandlers);
 };
