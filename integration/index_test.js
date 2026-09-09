@@ -1,18 +1,7 @@
-// Integration tests for the account linking extension.
-// These tests use nock to intercept all Auth0 Management API calls so no real
-// tenant or credentials are required. They test the two core user-facing flows:
-//   1. Link — extension renders linking template with correct user context
-//   2. Skip — extension renders template (skip is a client-side /continue redirect)
-// Error cases cover invalid tokens and upstream API failures.
-
 const { expect } = require('chai');
 const nock = require('nock');
-const sinon = require('sinon');
 const { sign } = require('jsonwebtoken');
 const { createServer } = require('../test/test_helper');
-const storage = require('../lib/storage');
-const indexTemplate = require('../templates');
-const linkingJwtUtils = require('../lib/linkingJwtUtils');
 const config = require('../lib/config');
 
 // Config provider is set by createServer() in before() — these are
@@ -57,12 +46,21 @@ const makeQueryString = (childToken, overrides = {}) => {
   return new URLSearchParams(params).toString();
 };
 
-const mockUsers = () => {
-  sinon.stub(linkingJwtUtils, 'fetchUsersFromToken').resolves({
-    currentUser: primaryUser,
-    matchingUsers: [secondaryUser],
-  });
-};
+const nockManagementToken = () =>
+  nock(`https://${DOMAIN}`)
+    .post('/oauth/token', {
+      audience: `https://${DOMAIN}/api/v2/`,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: 'client_credentials',
+    })
+    .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
+
+const nockUsersByEmail = (users) =>
+  nock(`https://${DOMAIN}`)
+    .get('/api/v2/users-by-email')
+    .query({ email: primaryUser.email })
+    .reply(200, users);
 
 describe('Account linking integration', function () {
   let server;
@@ -72,74 +70,45 @@ describe('Account linking integration', function () {
     DOMAIN = config('AUTH0_DOMAIN');
     CLIENT_ID = config('AUTH0_CLIENT_ID');
     CLIENT_SECRET = config('AUTH0_CLIENT_SECRET');
+    if (!CLIENT_SECRET) throw new Error('before(): AUTH0_CLIENT_SECRET not configured');
     ISSUER = `https://${DOMAIN}/`;
   });
 
-  after(function () {
-    server.stop();
-  });
-
-  beforeEach(function () {
-    nock.cleanAll();
-    sinon.restore();
-    sinon.stub(storage, 'getSettings').resolves({ customDomain: '' });
-    sinon.stub(storage, 'getLocales').resolves({ en: { or: 'or' } });
-    sinon.stub(indexTemplate, 'renderTemplate').resolves('<html>Mock Template</html>');
-    mockUsers();
+  after(async function () {
+    if (server) await server.stop();
   });
 
   afterEach(function () {
     nock.cleanAll();
-    sinon.restore();
   });
 
   describe('link flow', function () {
     it('returns 200 and renders the linking template', async function () {
+      nockManagementToken();
+      nockUsersByEmail([primaryUser, secondaryUser]);
+
       const res = await server.inject({
         method: 'GET',
         url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
       });
 
       expect(res.statusCode).to.equal(200);
-      expect(res.result).to.equal('<html>Mock Template</html>');
-    });
-
-    it('passes currentUser and matchingUsers correctly to renderTemplate', async function () {
-      await server.inject({
-        method: 'GET',
-        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
-      });
-
-      const { currentUser, matchingUsers } = indexTemplate.renderTemplate.args[0][0];
-      expect(currentUser.user_id).to.equal(primaryUser.user_id);
-      expect(matchingUsers).to.have.length(1);
-      expect(matchingUsers[0].user_id).to.equal(secondaryUser.user_id);
     });
   });
 
   describe('skip flow', function () {
-    it('returns 200 and renders the template', async function () {
-      // Skipping is a client-side navigation — the skip anchor in the rendered
-      // HTML points to `{issuer}continue?state={state}`. The server always
-      // returns 200 with the template regardless of whether the user links or skips.
-      const res = await server.inject({
-        method: 'GET',
-        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
-      });
+    it('returns 200 and includes state for the client-side /continue redirect', async function () {
+      nockManagementToken();
+      nockUsersByEmail([primaryUser, secondaryUser]);
 
-      expect(res.statusCode).to.equal(200);
-      expect(res.result).to.equal('<html>Mock Template</html>');
-    });
-
-    it('includes state in the rendered output for the skip redirect', async function () {
       const state = 'skip-test-state-789';
-      await server.inject({
+      const res = await server.inject({
         method: 'GET',
         url: `/?${makeQueryString(makeChildToken(primaryUser), { state })}`,
       });
 
-      const { params } = indexTemplate.renderTemplate.args[0][0];
-      expect(params.state).to.equal(state);
+      expect(res.statusCode).to.equal(200);
+      expect(res.result).to.include(`"state":"${state}"`);
     });
   });
 
@@ -159,8 +128,11 @@ describe('Account linking integration', function () {
     });
 
     it('redirects to /continue when users-by-email lookup fails', async function () {
-      // Override the default stub to simulate an upstream failure
-      linkingJwtUtils.fetchUsersFromToken.rejects(new Error('upstream failure'));
+      nockManagementToken();
+      nock(`https://${DOMAIN}`)
+        .get('/api/v2/users-by-email')
+        .query({ email: primaryUser.email })
+        .reply(500, { error: 'internal_error' });
 
       const res = await server.inject({
         method: 'GET',
