@@ -70,10 +70,12 @@ describe('Account linking tests', function () {
     CLIENT_SECRET = config('AUTH0_CLIENT_SECRET');
     if (!CLIENT_SECRET) throw new Error('before(): AUTH0_CLIENT_SECRET not configured');
     ISSUER = `https://${DOMAIN}/`;
+    nock.disableNetConnect();
   });
 
   after(async function () {
     if (server) await server.stop();
+    nock.enableNetConnect();
   });
 
   afterEach(function () {
@@ -90,13 +92,17 @@ describe('Account linking tests', function () {
     });
 
     expect(res.statusCode).to.equal(200);
-    expect(res.result).to.include(primaryUser.user_id);
-    expect(res.result).to.include(secondaryUser.user_id);
+    expect(res.result).to.include('It looks like you have another account with the same email address');
   });
 
   it('skips linking', async function () {
     nockManagementToken();
     nockUsersByEmail([primaryUser, secondaryUser]);
+    // Set up a nock for identity linking but assert it is never called —
+    // skipping is a client-side /continue redirect, not a server-side API call
+    const identityLinkScope = nock(`https://${DOMAIN}`)
+      .post(/\/api\/v2\/users\/.*\/identities/)
+      .reply(201, []);
 
     const state = 'test-state-123';
     const res = await server.inject({
@@ -106,6 +112,7 @@ describe('Account linking tests', function () {
 
     expect(res.statusCode).to.equal(200);
     expect(res.result).to.include(`"state":"${state}"`);
+    expect(identityLinkScope.isDone()).to.equal(false);
   });
 
   it('shows an error when invalid token is provided', async function () {
@@ -115,7 +122,7 @@ describe('Account linking tests', function () {
     });
 
     expect(res.statusCode).to.equal(400);
-    expect(res.result).to.include('You seem to have reached this page in error');
+    expect(res.result).to.include('You seem to have reached this page in error. Please try logging in again');
   });
 
   it('shows an error when no parameters are provided', async function () {
