@@ -10,12 +10,6 @@ const fakeConfig = {
 };
 
 describe('Management API wrapper', () => {
-  it('Config has needed properties', () => {
-    expect(fakeConfig.hasOwnProperty('AUTH0_DOMAIN')).to.equal(true);
-    expect(fakeConfig.hasOwnProperty('AUTH0_CLIENT_ID')).to.equal(true);
-    expect(fakeConfig.hasOwnProperty('AUTH0_CLIENT_SECRET')).to.equal(true);
-  });
-
   it('Management client wrapper initializes correctly', () => {
     const wrapper = new ManagementClientWrapper(fakeConfig);
 

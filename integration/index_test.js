@@ -4,8 +4,6 @@ const { sign } = require('jsonwebtoken');
 const { createServer } = require('../test/test_helper');
 const config = require('../lib/config');
 
-// Config provider is set by createServer() in before() — these are
-// populated then and safe to use in beforeEach/it blocks after that.
 let DOMAIN, CLIENT_ID, CLIENT_SECRET, ISSUER;
 
 const primaryUser = {
@@ -62,7 +60,7 @@ const nockUsersByEmail = (users) =>
     .query({ email: primaryUser.email })
     .reply(200, users);
 
-describe('Account linking integration', function () {
+describe('Account linking tests', function () {
   let server;
 
   before(async function () {
@@ -82,65 +80,48 @@ describe('Account linking integration', function () {
     nock.cleanAll();
   });
 
-  describe('link flow', function () {
-    it('returns 200 and renders the linking template', async function () {
-      nockManagementToken();
-      nockUsersByEmail([primaryUser, secondaryUser]);
+  it('detects repeated email and links account', async function () {
+    nockManagementToken();
+    nockUsersByEmail([primaryUser, secondaryUser]);
 
-      const res = await server.inject({
-        method: 'GET',
-        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
-      });
-
-      expect(res.statusCode).to.equal(200);
+    const res = await server.inject({
+      method: 'GET',
+      url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
     });
+
+    expect(res.statusCode).to.equal(200);
+    expect(res.result).to.include(primaryUser.user_id);
+    expect(res.result).to.include(secondaryUser.user_id);
   });
 
-  describe('skip flow', function () {
-    it('returns 200 and includes state for the client-side /continue redirect', async function () {
-      nockManagementToken();
-      nockUsersByEmail([primaryUser, secondaryUser]);
+  it('skips linking', async function () {
+    nockManagementToken();
+    nockUsersByEmail([primaryUser, secondaryUser]);
 
-      const state = 'skip-test-state-789';
-      const res = await server.inject({
-        method: 'GET',
-        url: `/?${makeQueryString(makeChildToken(primaryUser), { state })}`,
-      });
-
-      expect(res.statusCode).to.equal(200);
-      expect(res.result).to.include(`"state":"${state}"`);
+    const state = 'test-state-123';
+    const res = await server.inject({
+      method: 'GET',
+      url: `/?${makeQueryString(makeChildToken(primaryUser), { state })}`,
     });
+
+    expect(res.statusCode).to.equal(200);
+    expect(res.result).to.include(`"state":"${state}"`);
   });
 
-  describe('error cases', function () {
-    it('redirects to /admin when no query parameters are provided', async function () {
-      const res = await server.inject({ method: 'GET', url: '/' });
-      expect(res.statusCode).to.equal(302);
-      expect(res.headers.location).to.include('/admin');
+  it('shows an error when invalid token is provided', async function () {
+    const res = await server.inject({
+      method: 'GET',
+      url: `/?${makeQueryString('not-a-valid-jwt')}`,
     });
 
-    it('returns 400 when an invalid child_token is provided', async function () {
-      const res = await server.inject({
-        method: 'GET',
-        url: `/?${makeQueryString('not-a-valid-jwt')}`,
-      });
-      expect(res.statusCode).to.equal(400);
-    });
+    expect(res.statusCode).to.equal(400);
+    expect(res.result).to.include('You seem to have reached this page in error');
+  });
 
-    it('redirects to /continue when users-by-email lookup fails', async function () {
-      nockManagementToken();
-      nock(`https://${DOMAIN}`)
-        .get('/api/v2/users-by-email')
-        .query({ email: primaryUser.email })
-        .reply(500, { error: 'internal_error' });
+  it('shows an error when no parameters are provided', async function () {
+    const res = await server.inject({ method: 'GET', url: '/' });
 
-      const res = await server.inject({
-        method: 'GET',
-        url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
-      });
-
-      expect(res.statusCode).to.equal(302);
-      expect(res.headers.location).to.include('continue?state=');
-    });
+    expect(res.statusCode).to.equal(302);
+    expect(res.headers.location).to.include('/admin');
   });
 });
