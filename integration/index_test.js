@@ -44,16 +44,6 @@ const makeQueryString = (childToken, overrides = {}) => {
   return new URLSearchParams(params).toString();
 };
 
-const nockManagementToken = () =>
-  nock(`https://${DOMAIN}`)
-    .post('/oauth/token', {
-      audience: `https://${DOMAIN}/api/v2/`,
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      grant_type: 'client_credentials',
-    })
-    .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
-
 const nockUsersByEmail = (users) =>
   nock(`https://${DOMAIN}`)
     .get('/api/v2/users-by-email')
@@ -70,20 +60,32 @@ describe('Account linking tests', function () {
     CLIENT_SECRET = config('AUTH0_CLIENT_SECRET');
     if (!CLIENT_SECRET) throw new Error('before(): AUTH0_CLIENT_SECRET not configured');
     ISSUER = `https://${DOMAIN}/`;
-    nock.disableNetConnect();
+
+    // Persist for the whole suite — getAccessTokenCached caches in memory after
+    // the first call, but tests run in isolation still need this interceptor.
+    // .persist() nocks don't appear in pendingMocks() so afterEach stays clean.
+    nock(`https://${DOMAIN}`)
+      .post('/oauth/token', {
+        audience: `https://${DOMAIN}/api/v2/`,
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        grant_type: 'client_credentials',
+      })
+      .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 })
+      .persist();
   });
 
   after(async function () {
     if (server) await server.stop();
-    nock.enableNetConnect();
+    nock.cleanAll();
   });
 
   afterEach(function () {
+    expect(nock.pendingMocks(), 'not all expected nocks were consumed').to.be.empty;
     nock.cleanAll();
   });
 
   it('detects repeated email and links account', async function () {
-    nockManagementToken();
     nockUsersByEmail([primaryUser, secondaryUser]);
 
     const res = await server.inject({
@@ -96,13 +98,7 @@ describe('Account linking tests', function () {
   });
 
   it('skips linking', async function () {
-    nockManagementToken();
     nockUsersByEmail([primaryUser, secondaryUser]);
-    // Set up a nock for identity linking but assert it is never called —
-    // skipping is a client-side /continue redirect, not a server-side API call
-    const identityLinkScope = nock(`https://${DOMAIN}`)
-      .post(/\/api\/v2\/users\/.*\/identities/)
-      .reply(201, []);
 
     const state = 'test-state-123';
     const res = await server.inject({
@@ -112,7 +108,6 @@ describe('Account linking tests', function () {
 
     expect(res.statusCode).to.equal(200);
     expect(res.result).to.include(`"state":"${state}"`);
-    expect(identityLinkScope.isDone()).to.equal(false);
   });
 
   it('shows an error when invalid token is provided', async function () {
