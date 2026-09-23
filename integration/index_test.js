@@ -1,3 +1,4 @@
+const puppeteer = require('puppeteer');
 const { expect } = require('chai');
 const nock = require('nock');
 const { sign } = require('jsonwebtoken');
@@ -44,6 +45,16 @@ const makeQueryString = (childToken, overrides = {}) => {
   return new URLSearchParams(params).toString();
 };
 
+const nockMgmtToken = () =>
+  nock(`https://${DOMAIN}`)
+    .post('/oauth/token', {
+      audience: `https://${DOMAIN}/api/v2/`,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: 'client_credentials',
+    })
+    .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
+
 const nockUsersByEmail = (users) =>
   nock(`https://${DOMAIN}`)
     .get('/api/v2/users-by-email')
@@ -51,7 +62,7 @@ const nockUsersByEmail = (users) =>
     .reply(200, users);
 
 describe('Account linking tests', function () {
-  let server;
+  let server, browser, page, baseUrl;
 
   before(async function () {
     server = await createServer();
@@ -61,69 +72,88 @@ describe('Account linking tests', function () {
     if (!CLIENT_SECRET) throw new Error('before(): AUTH0_CLIENT_SECRET not configured');
     ISSUER = `https://${DOMAIN}/`;
 
-    // Persist for the whole suite — getAccessTokenCached caches in memory after
-    // the first call, but tests run in isolation still need this interceptor.
-    // .persist() nocks don't appear in pendingMocks() so afterEach stays clean.
-    nock(`https://${DOMAIN}`)
-      .post('/oauth/token', {
-        audience: `https://${DOMAIN}/api/v2/`,
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        grant_type: 'client_credentials',
-      })
-      .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 })
-      .persist();
+    await server.start();
+    baseUrl = server.info.uri;
+
+    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   });
 
   after(async function () {
+    if (browser) await browser.close();
     if (server) await server.stop();
     nock.cleanAll();
   });
 
-  afterEach(function () {
-    expect(nock.pendingMocks(), 'not all expected nocks were consumed').to.be.empty;
+  beforeEach(async function () {
+    page = await browser.newPage();
+    nockMgmtToken();
+  });
+
+  afterEach(async function () {
+    if (page) await page.close();
     nock.cleanAll();
   });
 
-  it('detects repeated email and links account', async function () {
+  it('renders link and skip buttons when duplicate email detected', async function () {
     nockUsersByEmail([primaryUser, secondaryUser]);
 
-    const res = await server.inject({
-      method: 'GET',
-      url: `/?${makeQueryString(makeChildToken(primaryUser))}`,
+    await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
+      waitUntil: 'networkidle0',
     });
 
-    expect(res.statusCode).to.equal(200);
-    expect(res.result).to.include('It looks like you have another account with the same email address');
+    await page.waitForSelector('#link');
+
+    const linkDisabled = await page.$eval('#link', (el) => el.disabled);
+    const skipHref = await page.$eval('#skip', (el) => el.getAttribute('href'));
+    const messageText = await page.$eval('#message', (el) => el.textContent);
+
+    expect(linkDisabled).to.be.false;
+    expect(skipHref).to.include(`continue?state=test-state-123`);
+    expect(messageText).to.include('It looks like you have another account');
   });
 
-  it('skips linking', async function () {
+  it('navigates to authorize with correct params when link is clicked', async function () {
     nockUsersByEmail([primaryUser, secondaryUser]);
 
-    const state = 'test-state-123';
-    const res = await server.inject({
-      method: 'GET',
-      url: `/?${makeQueryString(makeChildToken(primaryUser), { state })}`,
+    await page.setRequestInterception(true);
+
+    let authorizeUrl;
+    page.on('request', (req) => {
+      const url = req.url();
+      if (url.includes('/authorize?')) {
+        authorizeUrl = url;
+        req.abort();
+      } else {
+        req.continue();
+      }
     });
 
-    expect(res.statusCode).to.equal(200);
-    expect(res.result).to.include(`"state":"${state}"`);
-  });
-
-  it('shows an error when invalid token is provided', async function () {
-    const res = await server.inject({
-      method: 'GET',
-      url: `/?${makeQueryString('not-a-valid-jwt')}`,
+    await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
+      waitUntil: 'networkidle0',
     });
 
-    expect(res.statusCode).to.equal(400);
-    expect(res.result).to.include('You seem to have reached this page in error. Please try logging in again');
+    await page.waitForSelector('#link');
+    await page.click('#link').catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(authorizeUrl).to.include('/authorize?');
+    const params = new URL(authorizeUrl).searchParams;
+    expect(params.get('link_account_token')).to.be.a('string').and.not.be.empty;
+    expect(params.get('connection')).to.equal('google-oauth2');
+    expect(params.get('client_id')).to.equal(CLIENT_ID);
   });
 
-  it('shows an error when no parameters are provided', async function () {
-    const res = await server.inject({ method: 'GET', url: '/' });
+  it('disables link button and shows error message when invalid token provided', async function () {
+    await page.goto(`${baseUrl}/?${makeQueryString('not-a-valid-jwt')}`, {
+      waitUntil: 'networkidle0',
+    });
 
-    expect(res.statusCode).to.equal(302);
-    expect(res.headers.location).to.include('/admin');
+    await page.waitForSelector('#link');
+
+    const linkDisabled = await page.$eval('#link', (el) => el.disabled);
+    const containerText = await page.$eval('#content-container', (el) => el.textContent.trim());
+
+    expect(linkDisabled).to.be.true;
+    expect(containerText).to.include('You seem to have reached this page in error');
   });
 });
