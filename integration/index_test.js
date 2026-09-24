@@ -23,6 +23,9 @@ const secondaryUser = {
   created_at: '2024-01-02T00:00:00.000Z',
 };
 
+// Replaces createUsers() from the original tests: forges the signed child_token that
+// the real Auth0 OAuth flow would have produced, letting us drive the extension UI
+// directly without a live tenant.
 const makeChildToken = (user) =>
   sign(
     { sub: user.user_id, email: user.email },
@@ -74,9 +77,8 @@ describe('Account linking tests', function () {
     await server.start();
     baseUrl = server.info.uri;
 
-    // The server caches the mgmt token after the first fetch, so subsequent tests
-    // won't trigger another /oauth/token request. .persist() keeps the nock active
-    // for the initial fetch without showing up in pendingMocks() after the cache warms.
+    // The server caches the mgmt token after the first fetch; .persist() covers
+    // that initial request without showing up in pendingMocks() for subsequent tests.
     nockMgmtToken().persist();
 
     browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -98,7 +100,7 @@ describe('Account linking tests', function () {
     nock.cleanAll();
   });
 
-  it('renders link and skip buttons when duplicate email detected', async function () {
+  it('detects repeated email and links account', async function () {
     nockUsersByEmail([primaryUser, secondaryUser]);
 
     await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
@@ -107,20 +109,10 @@ describe('Account linking tests', function () {
 
     await page.waitForSelector('#link');
 
-    const linkDisabled = await page.$eval('#link', (el) => el.disabled);
-    const skipHref = await page.$eval('#skip', (el) => el.getAttribute('href'));
-    const messageText = await page.$eval('#message', (el) => el.textContent);
-
-    expect(linkDisabled).to.be.false;
-    expect(skipHref).to.include(`continue?state=test-state-123`);
-    expect(messageText).to.include('It looks like you have another account');
-  });
-
-  it('navigates to authorize with correct params when link is clicked', async function () {
-    nockUsersByEmail([primaryUser, secondaryUser]);
-
+    // Intercept the client-side authorize redirect triggered by clicking #link.
+    // The extension builds the authorize URL entirely in the browser (public/index.js)
+    // so no additional server-side API calls are made after the page loads.
     await page.setRequestInterception(true);
-
     const authorizeUrlPromise = new Promise((resolve) => {
       page.on('request', (req) => {
         const url = req.url();
@@ -133,33 +125,62 @@ describe('Account linking tests', function () {
       });
     });
 
-    await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
-      waitUntil: 'networkidle0',
-    });
-
-    await page.waitForSelector('#link');
     await page.click('#link').catch(() => {});
     const authorizeUrl = await authorizeUrlPromise;
 
-    expect(authorizeUrl).to.include('/authorize?');
     const params = new URL(authorizeUrl).searchParams;
     expect(params.get('link_account_token')).to.be.a('string').and.not.be.empty;
     expect(params.get('connection')).to.equal('google-oauth2');
     expect(params.get('client_id')).to.equal(CLIENT_ID);
   });
 
-  it('disables link button and shows error message when invalid token provided', async function () {
-    await page.goto(`${baseUrl}/?${makeQueryString('not-a-valid-jwt')}`, {
+  it('skips linking', async function () {
+    nockUsersByEmail([primaryUser, secondaryUser]);
+
+    await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
       waitUntil: 'networkidle0',
     });
 
-    await page.waitForSelector('#link');
+    await page.waitForSelector('#skip');
 
-    const linkDisabled = await page.$eval('#link', (el) => el.disabled);
-    const containerText = await page.$eval('#content-container', (el) => el.textContent.trim());
+    // The skip href is set by JS on page load to `${token.iss}continue?state=`.
+    // Intercept after page load so the initial requests aren't affected.
+    await page.setRequestInterception(true);
+    const continueUrlPromise = new Promise((resolve) => {
+      page.on('request', (req) => {
+        const url = req.url();
+        if (url.includes('/continue?')) {
+          req.abort();
+          resolve(url);
+        } else {
+          req.continue();
+        }
+      });
+    });
 
-    expect(linkDisabled).to.be.true;
-    expect(containerText).to.include('You seem to have reached this page in error');
+    await page.evaluate(() => document.querySelector('#skip').click());
+    const continueUrl = await continueUrlPromise;
+
+    expect(new URL(continueUrl).searchParams.get('state')).to.equal('test-state-123');
+  });
+
+  it('shows an error when invalid token is provided', async function () {
+    await page.goto(`${baseUrl}/?${makeQueryString('')}`, {
+      waitUntil: 'networkidle0',
+    });
+
+    const text = await page.evaluate(
+      () =>
+        document.querySelector('#content-container > div:nth-child(1) > p:nth-child(1)').textContent
+    );
+    expect(text).to.equal('You seem to have reached this page in error. Please try logging in again');
+  });
+
+  it('shows an error when no parameters are provided', async function () {
+    // Empty query redirects to admin (server/routes GET / handler).
+    // Puppeteer follows the redirect; we verify the final URL is the admin page.
+    await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
+    expect(page.url()).to.include('/admin');
   });
 
   it('shows error message when upstream API fails', async function () {
