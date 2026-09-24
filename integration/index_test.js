@@ -77,10 +77,6 @@ describe('Account linking tests', function () {
     await server.start();
     baseUrl = server.info.uri;
 
-    // The server caches the mgmt token after the first fetch; .persist() covers
-    // that initial request without showing up in pendingMocks() for subsequent tests.
-    nockMgmtToken().persist();
-
     browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   });
 
@@ -101,6 +97,7 @@ describe('Account linking tests', function () {
   });
 
   it('detects repeated email and links account', async function () {
+    nockMgmtToken();
     nockUsersByEmail([primaryUser, secondaryUser]);
 
     await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
@@ -135,6 +132,7 @@ describe('Account linking tests', function () {
   });
 
   it('skips linking', async function () {
+    nockMgmtToken();
     nockUsersByEmail([primaryUser, secondaryUser]);
 
     await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
@@ -184,6 +182,7 @@ describe('Account linking tests', function () {
   });
 
   it('shows error message when upstream API fails', async function () {
+    nockMgmtToken();
     nock(`https://${DOMAIN}`)
       .get('/api/v2/users-by-email')
       .query({ email: primaryUser.email })
