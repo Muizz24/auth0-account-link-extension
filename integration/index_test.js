@@ -48,6 +48,10 @@ const makeQueryString = (childToken, overrides = {}) => {
   return new URLSearchParams(params).toString();
 };
 
+// Returns a properly signed JWT so getAccessTokenCached (auth0-extension-tools) can
+// decode exp and cache the token consistently across platforms. Without a valid JWT
+// the TTL is NaN, which Node.js/V8 treats inconsistently on different OSes — the
+// token may or may not be cached, causing flaky "pending mock" failures in afterEach.
 const nockMgmtToken = () =>
   nock(`https://${DOMAIN}`)
     .post('/oauth/token', {
@@ -56,7 +60,11 @@ const nockMgmtToken = () =>
       client_secret: CLIENT_SECRET,
       grant_type: 'client_credentials',
     })
-    .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
+    .reply(200, {
+      access_token: sign({}, CLIENT_SECRET, { expiresIn: '1h' }),
+      token_type: 'Bearer',
+      expires_in: 3600,
+    });
 
 const nockUsersByEmail = (users, email = primaryUser.email) =>
   nock(`https://${DOMAIN}`)
@@ -132,7 +140,7 @@ describe('Account linking tests', function () {
   });
 
   it('skips linking', async function () {
-    nockMgmtToken();
+    // Token was cached after test 1; only nock the Management API users call.
     nockUsersByEmail([primaryUser, secondaryUser]);
 
     await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
@@ -182,7 +190,7 @@ describe('Account linking tests', function () {
   });
 
   it('shows error message when upstream API fails', async function () {
-    nockMgmtToken();
+    // Token is still cached from test 1; only nock the failing users-by-email call.
     nock(`https://${DOMAIN}`)
       .get('/api/v2/users-by-email')
       .query({ email: primaryUser.email })
