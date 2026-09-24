@@ -189,12 +189,25 @@ describe('Account linking tests', function () {
       .query({ email: primaryUser.email })
       .reply(500, { error: 'server_error', message: 'Internal server error' });
 
-    await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
-      waitUntil: 'networkidle0',
+    // When the Management API fails the server redirects to /continue?state= rather
+    // than rendering an error page (api/get_index.js catch block). Intercept that
+    // redirect to assert the server handled the failure and preserved the state.
+    await page.setRequestInterception(true);
+    const continueUrlPromise = new Promise((resolve) => {
+      page.on('request', (req) => {
+        const url = req.url();
+        if (url.includes('/continue?')) {
+          req.abort();
+          resolve(url);
+        } else {
+          req.continue();
+        }
+      });
     });
 
-    await page.waitForSelector('#content-container');
-    const containerText = await page.$eval('#content-container', (el) => el.textContent.trim());
-    expect(containerText).to.include('You seem to have reached this page in error');
+    page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`).catch(() => {});
+    const continueUrl = await continueUrlPromise;
+
+    expect(new URL(continueUrl).searchParams.get('state')).to.equal('test-state-123');
   });
 });
