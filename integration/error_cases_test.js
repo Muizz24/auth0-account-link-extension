@@ -5,6 +5,7 @@ describe('Account linking HTTP edge cases', function () {
   let server;
 
   before(async function () {
+    // server.inject() works on a stopped server in Hapi; no server.start() needed here.
     server = await createServer();
   });
 

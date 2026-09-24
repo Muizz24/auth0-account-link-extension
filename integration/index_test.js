@@ -55,10 +55,10 @@ const nockMgmtToken = () =>
     })
     .reply(200, { access_token: 'mock-mgmt-token', token_type: 'Bearer', expires_in: 86400 });
 
-const nockUsersByEmail = (users) =>
+const nockUsersByEmail = (users, email = primaryUser.email) =>
   nock(`https://${DOMAIN}`)
     .get('/api/v2/users-by-email')
-    .query({ email: primaryUser.email })
+    .query({ email })
     .reply(200, users);
 
 describe('Account linking tests', function () {
@@ -69,7 +69,6 @@ describe('Account linking tests', function () {
     DOMAIN = config('AUTH0_DOMAIN');
     CLIENT_ID = config('AUTH0_CLIENT_ID');
     CLIENT_SECRET = config('AUTH0_CLIENT_SECRET');
-    if (!CLIENT_SECRET) throw new Error('before(): AUTH0_CLIENT_SECRET not configured');
     ISSUER = `https://${DOMAIN}/`;
 
     await server.start();
@@ -86,15 +85,16 @@ describe('Account linking tests', function () {
 
   beforeEach(async function () {
     page = await browser.newPage();
-    nockMgmtToken();
   });
 
   afterEach(async function () {
     if (page) await page.close();
+    expect(nock.pendingMocks()).to.be.empty;
     nock.cleanAll();
   });
 
   it('renders link and skip buttons when duplicate email detected', async function () {
+    nockMgmtToken();
     nockUsersByEmail([primaryUser, secondaryUser]);
 
     await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
@@ -113,19 +113,21 @@ describe('Account linking tests', function () {
   });
 
   it('navigates to authorize with correct params when link is clicked', async function () {
+    nockMgmtToken();
     nockUsersByEmail([primaryUser, secondaryUser]);
 
     await page.setRequestInterception(true);
 
-    let authorizeUrl;
-    page.on('request', (req) => {
-      const url = req.url();
-      if (url.includes('/authorize?')) {
-        authorizeUrl = url;
-        req.abort();
-      } else {
-        req.continue();
-      }
+    const authorizeUrlPromise = new Promise((resolve) => {
+      page.on('request', (req) => {
+        const url = req.url();
+        if (url.includes('/authorize?')) {
+          req.abort();
+          resolve(url);
+        } else {
+          req.continue();
+        }
+      });
     });
 
     await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
@@ -134,7 +136,7 @@ describe('Account linking tests', function () {
 
     await page.waitForSelector('#link');
     await page.click('#link').catch(() => {});
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    const authorizeUrl = await authorizeUrlPromise;
 
     expect(authorizeUrl).to.include('/authorize?');
     const params = new URL(authorizeUrl).searchParams;
@@ -154,6 +156,22 @@ describe('Account linking tests', function () {
     const containerText = await page.$eval('#content-container', (el) => el.textContent.trim());
 
     expect(linkDisabled).to.be.true;
+    expect(containerText).to.include('You seem to have reached this page in error');
+  });
+
+  it('shows error message when upstream API fails', async function () {
+    nockMgmtToken();
+    nock(`https://${DOMAIN}`)
+      .get('/api/v2/users-by-email')
+      .query({ email: primaryUser.email })
+      .reply(500, { error: 'server_error', message: 'Internal server error' });
+
+    await page.goto(`${baseUrl}/?${makeQueryString(makeChildToken(primaryUser))}`, {
+      waitUntil: 'networkidle0',
+    });
+
+    await page.waitForSelector('#content-container');
+    const containerText = await page.$eval('#content-container', (el) => el.textContent.trim());
     expect(containerText).to.include('You seem to have reached this page in error');
   });
 });
